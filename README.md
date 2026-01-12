@@ -1,166 +1,142 @@
-# 📘 Hướng Dẫn Sử Dụng Pipeline Bronze to Gold
+# Hướng Dẫn Sử Dụng Pipeline Bronze to Gold
 
-## Mục Lục
-1. [Tổng Quan](#tổng-quan)
-2. [Cấu Trúc Cơ Bản](#cấu-trúc-cơ-bản)
-3. [FULL LOAD - Hướng Dẫn Chi Tiết](#full-load---hướng-dẫn-chi-tiết)
-4. [INCREMENTAL LOAD - Hướng Dẫn Chi Tiết](#incremental-load---hướng-dẫn-chi-tiết)
-5. [TRANSFORM - Các Loại Biến Đổi](#transform---các-loại-biến-đổi)
-6. [Các Ví Dụ Thực Tế](#các-ví-dụ-thực-tế)
-7. [Troubleshooting](#troubleshooting)
+## Mục lục
 
----
-
-## 🎯 Tổng Quan
-
-Pipeline này thực hiện công việc chuyển dữ liệu từ tầng **Bronze** (dữ liệu thô) sang tầng **Gold** (dữ liệu đã xử lý).
-
-**Đặc điểm chính:**
-- ✅ Hỗ trợ 2 loại load: **FULL LOAD** và **INCREMENTAL LOAD**
-- ✅ Tự động **deduplication** theo khóa chỉ định
-- ✅ Hỗ trợ **Transform** dữ liệu (Derive YMD, Price Revenue)
-- ✅ Chạy **song song** (parallel) để tối ưu tốc độ
-- ✅ Tự động **partition** dữ liệu
+1. Tổng quan
+2. Cấu trúc cấu hình pipeline
+3. Full Load – Mô tả chi tiết
+4. Incremental Load – Mô tả chi tiết
+5. Transform – Các loại biến đổi dữ liệu
+6. Ví dụ triển khai thực tế
+7. Quy trình thêm bảng mới
+8. Các lưu ý quan trọng
+9. Troubleshooting
+10. Tối ưu hiệu suất
 
 ---
 
-## 📋 Cấu Trúc Cơ Bản
+## 1. Tổng quan
 
-Mỗi bảng được cấu hình bằng một **dictionary** trong danh sách `TABLE_CONFIGS`:
+Pipeline Bronze to Gold được thiết kế nhằm chuyển đổi dữ liệu từ tầng **Bronze** (dữ liệu thô, chưa xử lý) sang tầng **Gold** (dữ liệu đã được làm sạch, chuẩn hóa và tối ưu cho mục đích phân tích và báo cáo).
+
+Các đặc điểm chính của pipeline:
+
+* Hỗ trợ hai phương pháp tải dữ liệu: **Full Load** và **Incremental Load**
+* Tự động loại bỏ bản ghi trùng lặp dựa trên khóa định danh (deduplication)
+* Hỗ trợ các phép biến đổi dữ liệu phổ biến (ví dụ: tạo cột năm/tháng/ngày, tính doanh thu)
+* Hỗ trợ xử lý song song nhằm cải thiện hiệu suất
+* Hỗ trợ phân vùng dữ liệu (partitioning) để tối ưu truy vấn
+
+Pipeline phù hợp với kiến trúc Lakehouse và các mô hình dữ liệu Dimension / Fact.
+
+---
+
+## 2. Cấu trúc cấu hình pipeline
+
+Mỗi bảng được khai báo thông qua một dictionary trong danh sách `TABLE_CONFIGS`. Cấu trúc tổng quát như sau:
 
 ```python
 {
-    # ===== THÔNG TIN CƠ BẢN =====
     "gold_table": "Tên bảng trong Gold layer",
     "bronze_table": "Tên bảng trong Bronze layer",
     "load_type": "FULL hoặc INCREMENTAL",
     "table_category": "DIMENSION hoặc FACT",
-    
-    # ===== TIMESTAMP & DEDUP =====
-    "timestamp_col": "Cột timestamp cho dedup",
-    "partition_timestamp_col": "Cột timestamp cho partition",
-    "dedup_cols": ["Danh sách cột khóa cho dedup"],
-    
-    # ===== CỘT DỮ LIỆU =====
-    "columns": ["Danh sách cột cần lấy"],
-    "partition_cols": ["year", "month", "date"],  # Cột partition (nếu có)
-    
-    # ===== CÀI ĐẶT =====
-    "isLoad": True,  # True/False để bật/tắt load
-    "requires_transform": True/False,
+
+    "timestamp_col": "Cột timestamp dùng cho filter và dedup",
+    "partition_timestamp_col": "Cột timestamp dùng để tạo partition",
+    "dedup_cols": ["Danh sách cột khóa dùng cho deduplication"],
+
+    "columns": ["Danh sách cột cần trích xuất"],
+    "partition_cols": ["year", "month", "date"],
+
+    "isLoad": True,
+    "requires_transform": True,
     "transform_config": {
-        "type": ["DERIVE_YMD", "PRICE_REVENUE"],  # Loại transform
-        # ... cài đặt transform khác ...
+        "type": ["DERIVE_YMD", "PRICE_REVENUE"]
     }
 }
 ```
 
 ---
 
-## 🔄 FULL LOAD - Hướng Dẫn Chi Tiết
+## 3. Full Load – Mô tả chi tiết
 
-### Khái Niệm
-- **FULL LOAD**: Tải **toàn bộ dữ liệu** từ Bronze mỗi lần chạy
-- Sử dụng khi: Bảng nhỏ, thường xuyên thay đổi hoàn toàn, hoặc cần refresh toàn bộ
-- Cách hoạt động: **Xóa hết dữ liệu cũ → Tải toàn bộ dữ liệu mới**
+### 3.1 Khái niệm
 
-### Khi Nào Dùng FULL LOAD?
-1. **Bảng Master/Lookup nhỏ**: Danh mục, phân loại, bảng tham chiếu
-2. **Snapshot hàng ngày**: Trạng thái cơ sở dữ liệu tại một thời điểm
-3. **Dữ liệu không lớn**: < 1GB mỗi lần load
-4. **Yêu cầu cập nhật hoàn toàn**: Không cần giữ lại dữ liệu cũ
+Full Load là phương pháp tải toàn bộ dữ liệu từ Bronze layer sang Gold layer trong mỗi lần chạy pipeline. Dữ liệu hiện có trong Gold sẽ bị xóa và được thay thế hoàn toàn bằng dữ liệu mới.
 
-### Ví Dụ 1: FULL LOAD - Bảng Danh Mục
+### 3.2 Trường hợp sử dụng
+
+Full Load phù hợp trong các tình huống:
+
+* Bảng master hoặc lookup có kích thước nhỏ
+* Bảng snapshot định kỳ (daily snapshot, monthly snapshot)
+* Dữ liệu có dung lượng nhỏ hoặc trung bình
+* Không yêu cầu bảo toàn lịch sử dữ liệu
+
+### 3.3 Ví dụ cấu hình Full Load
 
 ```python
 {
-    "gold_table": "dim_taxonomy",                 # Bảng danh mục
+    "gold_table": "dim_taxonomy",
     "bronze_table": "taxonomy",
-    "load_type": "FULL",                          # ⭐ FULL LOAD
+    "load_type": "FULL",
     "table_category": "DIMENSION",
-    "timestamp_col": None,                        # Không có timestamp
-    "dedup_cols": ["taxonomy_id"],                # Khóa duy nhất
+    "timestamp_col": None,
+    "dedup_cols": ["taxonomy_id"],
     "columns": [
-        "id", "taxonomy_id", "name", "parent_id",
-        "created_at", "updated_at"
+        "id",
+        "taxonomy_id",
+        "name",
+        "parent_id",
+        "created_at",
+        "updated_at"
     ],
-    "partition_cols": None,                       # Không partition
+    "partition_cols": None,
     "isLoad": True,
-    "requires_transform": False                   # Không cần transform
+    "requires_transform": False
 }
 ```
-
-**Giải thích:**
-- Mỗi chạy pipeline → Tải lại toàn bộ bảng taxonomy từ Bronze
-- Đảm bảo danh mục luôn là phiên bản mới nhất
-- Không partition → Toàn bộ dữ liệu trong 1 thư mục
-
-### Ví Dụ 2: FULL LOAD - Bảng Thông Tin Shop (với Partition)
-
-```python
-{
-    "gold_table": "dim_shop_informations",
-    "bronze_table": "analysis_shop_informations",
-    "load_type": "FULL",                          # ⭐ FULL LOAD
-    "table_category": "DIMENSION",
-    "timestamp_col": "updated_at",                # Dùng để dedup
-    "partition_timestamp_col": "created_at",     # Dùng để derive YMD
-    "dedup_cols": ["shop_id"],                    # 1 shop_id = 1 hàng
-    "columns": [
-        "id", "shop_id", "name", "status", "url", 
-        "currency_code", "created_at", "updated_at",
-        "created_timestamp", "updated_timestamp", 
-        "is_vacation", "country"
-    ],
-    "partition_cols": ["year", "month", "date"],  # ⭐ Partition theo ngày
-    "isLoad": True,
-    "requires_transform": True,                   # ⭐ Cần transform
-    "transform_config": {
-        "type": ["DERIVE_YMD"]                    # Tạo cột year, month, date
-    }
-}
-```
-
-**Giải thích:**
-- **DEDUP**: Vì 1 shop có nhiều record lịch sử, chỉ giữ bản ghi mới nhất (by `updated_at`)
-- **PARTITION**: Dữ liệu được chia thành thư mục con theo năm/tháng/ngày
-- **TRANSFORM DERIVE_YMD**: Lấy `created_at` → Tạo cột `year`, `month`, `date`
-
-**Lợi ích Partition:**
-- 📊 Query nhanh hơn (không cần scan toàn bộ)
-- 💾 Dễ cleanup dữ liệu cũ
-- ⚡ Tối ưu performance
 
 ---
 
-## 📈 INCREMENTAL LOAD - Hướng Dẫn Chi Tiết
+## 4. Incremental Load – Mô tả chi tiết
 
-### Khái Niệm
-- **INCREMENTAL LOAD**: Chỉ tải **dữ liệu mới/thay đổi** từ Bronze
-- Sử dụng khi: Bảng lớn, thêm dữ liệu liên tục, cần tối ưu tốc độ
-- Cách hoạt động: **Lấy timestamp cuối cùng → Tải dữ liệu sau timestamp đó → Merge vào Gold**
+### 4.1 Khái niệm
 
-### Khi Nào Dùng INCREMENTAL LOAD?
-1. **Bảng sự kiện lớn**: Transaction, log, activity
-2. **Dữ liệu thêm liên tục**: Không bao giờ xóa/sửa dữ liệu cũ
-3. **Cần tối ưu tốc độ**: Tải chỉ dữ liệu mới
-4. **Lịch sử quan trọng**: Phải giữ lại tất cả bản ghi
+Incremental Load chỉ tải các bản ghi mới hoặc đã thay đổi kể từ lần chạy pipeline gần nhất. Pipeline sẽ xác định timestamp lớn nhất trong Gold layer và chỉ xử lý dữ liệu Bronze có timestamp lớn hơn giá trị này.
 
-### Ví Dụ 1: INCREMENTAL LOAD - Bảng Thông Tin Listing
+### 4.2 Trường hợp sử dụng
+
+Incremental Load được khuyến nghị cho:
+
+* Bảng fact hoặc bảng sự kiện có dung lượng lớn
+* Dữ liệu được bổ sung liên tục theo thời gian
+* Yêu cầu tối ưu thời gian xử lý
+* Cần lưu trữ đầy đủ lịch sử dữ liệu
+
+### 4.3 Ví dụ cấu hình Incremental Load
 
 ```python
 {
     "gold_table": "dim_listing_information",
     "bronze_table": "analysis_listing_information",
-    "load_type": "INCREMENTAL",                  # ⭐ INCREMENTAL LOAD
+    "load_type": "INCREMENTAL",
     "table_category": "DIMENSION",
-    "timestamp_col": "creation_timestamp",       # Dùng để filter & dedup
+    "timestamp_col": "creation_timestamp",
     "partition_timestamp_col": "creation_timestamp",
-    "dedup_cols": ["listing_id"],                # 1 listing = 1 hàng
+    "dedup_cols": ["listing_id"],
     "columns": [
-        "listing_id", "shop_id", "user_id", "title", 
-        "description", "state", "url", "price", 
-        "currency_code", "taxonomy_id", 
+        "listing_id",
+        "shop_id",
+        "user_id",
+        "title",
+        "description",
+        "state",
+        "url",
+        "price",
+        "currency_code",
+        "taxonomy_id",
         "creation_timestamp"
     ],
     "partition_cols": ["year", "month", "date"],
@@ -172,169 +148,77 @@ Mỗi bảng được cấu hình bằng một **dictionary** trong danh sách `
 }
 ```
 
-**Quy Trình Chạy:**
-1. ⏱️ **Lấy timestamp cuối**: `SELECT MAX(creation_timestamp) FROM gold.dim_listing_information`
-   - VD: `2024-01-15 10:30:00`
-2. 🔍 **Filter dữ liệu mới**: `WHERE creation_timestamp > 2024-01-15 10:30:00`
-3. 🔄 **Dedup**: Giữ bản ghi mới nhất cho mỗi `listing_id`
-4. 📝 **Transform**: Tạo cột year, month, date
-5. ✅ **Merge**: 
-   - Nếu `listing_id` tồn tại → **UPDATE** (nếu dữ liệu mới)
-   - Nếu `listing_id` không tồn tại → **INSERT**
-
-### Ví Dụ 2: INCREMENTAL LOAD - Bảng Performance (với Transform PRICE_REVENUE)
-
-```python
-{
-    "gold_table": "fact_listing_performance_by_date",
-    "bronze_table": "analysis_listing_performance_by_date",
-    "load_type": "INCREMENTAL",                  # ⭐ INCREMENTAL LOAD
-    "table_category": "FACT",
-    "timestamp_col": "created_at",               # Filter & merge key
-    "partition_timestamp_col": "created_at",
-    "dedup_cols": ["shop_id", "listing_id", "report_date"],  # Key duy nhất
-    "columns": [
-        "site_id", "shop_id", "listing_id", "report_date",
-        "daily_sales", "daily_views", "daily_favorers",
-        "conversion_rate", "views", "favorers", "created_at"
-    ],
-    "partition_cols": ["year", "month", "date"],
-    "isLoad": True,
-    "requires_transform": True,
-    "transform_config": {
-        "type": ["DERIVE_YMD", "PRICE_REVENUE"],  # ⭐ 2 loại transform
-        "join_table": "dim_listing_information",  # Join bảng này
-        "join_key": "shop_id",                    # Khóa join
-        "price_col": "price",                     # Cột giá từ dim_listing
-        "sales_col": "daily_sales"                # Cột sales cần tính revenue
-    }
-}
-```
-
-**Quy Trình Chạy:**
-1. 🔍 **Filter**: `WHERE created_at > (MAX created_at từ Gold)`
-2. 📝 **Transform DERIVE_YMD**: Tạo cột year, month, date từ created_at
-3. 📝 **Transform PRICE_REVENUE**: 
-   - Join với `dim_listing_information` by `shop_id`
-   - Lấy `price` từ dim_listing (bản ghi mới nhất)
-   - Tính `revenue = daily_sales × price`
-4. 🔄 **Dedup**: Giữ bản ghi mới nhất cho mỗi `(shop_id, listing_id, report_date)`
-5. ✅ **Merge**: Cập nhật hoặc thêm mới
-
 ---
 
-## 🔧 TRANSFORM - Các Loại Biến Đổi
+## 5. Transform – Các loại biến đổi dữ liệu
 
-### Transform 1: DERIVE_YMD (Tạo Cột Năm, Tháng, Ngày)
+### 5.1 Transform DERIVE_YMD
 
-**Mục đích**: Tạo 3 cột `year`, `month`, `date` từ cột timestamp để dùng cho partition
+**Mục đích:** Tạo các cột `year`, `month`, `date` từ một cột timestamp nhằm phục vụ partitioning.
 
-**Khi nào dùng:**
-- Hầu hết các bảng có partition theo ngày đều cần DERIVE_YMD
-- Bảng có `partition_cols: ["year", "month", "date"]`
+**Trường hợp sử dụng:**
 
-**Cấu hình:**
+* Các bảng được partition theo ngày
+* Các bảng fact hoặc dimension có dữ liệu theo thời gian
+
 ```python
 "transform_config": {
     "type": ["DERIVE_YMD"]
 }
 ```
 
-**Ví dụ:**
-```
-Trước:
-| listing_id | creation_timestamp  |
-|------------|---------------------|
-| 1001       | 2024-01-15 10:30:00 |
-| 1002       | 2024-01-15 14:20:00 |
+### 5.2 Transform PRICE_REVENUE
 
-Sau:
-| listing_id | creation_timestamp  | year | month | date       |
-|------------|---------------------|------|-------|------------|
-| 1001       | 2024-01-15 10:30:00 | 2024 | 1     | 2024-01-15 |
-| 1002       | 2024-01-15 14:20:00 | 2024 | 1     | 2024-01-15 |
+**Mục đích:** Tính toán doanh thu dựa trên số lượng bán và đơn giá, thông qua việc join với bảng dimension chứa thông tin giá.
+
+Công thức:
+
+```
+revenue = sales × price
 ```
 
-**Cấu hình hoàn chỉnh:**
-```python
-{
-    "gold_table": "dim_tags",
-    "bronze_table": "analysis_tags",
-    "load_type": "INCREMENTAL",
-    "timestamp_col": "updated_at",
-    "partition_timestamp_col": "created_at",      # ⭐ Lấy từ cột này
-    "partition_cols": ["year", "month", "date"],
-    "isLoad": True,
-    "requires_transform": True,
-    "transform_config": {
-        "type": ["DERIVE_YMD"]                    # Chỉ cần DERIVE_YMD
-    }
-}
-```
-
----
-
-### Transform 2: PRICE_REVENUE (Tính Doanh Thu)
-
-**Mục đích**: Join với bảng giá để tính doanh thu = sales × price
-
-**Khi nào dùng:**
-- Bảng fact cần tính doanh thu
-- Có giá từ bảng dimension khác
-- Cần cột `price` và `revenue`
-
-**Cấu hình:**
 ```python
 "transform_config": {
     "type": ["PRICE_REVENUE"],
-    "join_table": "dim_listing_information",  # Bảng chứa giá
-    "join_key": "shop_id",                    # Khóa join
-    "price_col": "price",                     # Cột giá trong bảng được join
-    "sales_col": "daily_sales"                # Cột sales để tính revenue
+    "join_table": "dim_listing_information",
+    "join_key": "shop_id",
+    "price_col": "price",
+    "sales_col": "daily_sales"
 }
 ```
 
-**Ví dụ chi tiết:**
+### 5.3 Kết hợp nhiều transform
 
-**Bronze dữ liệu:**
-```
-analysis_listing_performance_by_date:
-| shop_id | listing_id | report_date | daily_sales |
-|---------|------------|-------------|-------------|
-| S001    | L001       | 2024-01-15  | 10          |
-| S001    | L002       | 2024-01-15  | 5           |
+Pipeline cho phép áp dụng nhiều transform theo thứ tự được khai báo trong cấu hình.
 
-analysis_listing_information:
-| listing_id | price |
-|------------|-------|
-| L001       | 100   |
-| L002       | 50    |
-```
+---
 
-**Sau Transform:**
-```
-| shop_id | listing_id | report_date | daily_sales | price | revenue |
-|---------|------------|-------------|-------------|-------|---------|
-| S001    | L001       | 2024-01-15  | 10          | 100   | 1000    |
-| S001    | L002       | 2024-01-15  | 5           | 50    | 250     |
-```
+## 6. Ví dụ triển khai thực tế
 
-**Cấu hình hoàn chỉnh:**
+### Incremental Load cho bảng Fact có tính doanh thu
+
 ```python
 {
     "gold_table": "fact_listing_performance_by_date",
     "bronze_table": "analysis_listing_performance_by_date",
     "load_type": "INCREMENTAL",
+    "table_category": "FACT",
+    "timestamp_col": "created_at",
+    "partition_timestamp_col": "created_at",
     "dedup_cols": ["shop_id", "listing_id", "report_date"],
     "columns": [
-        "shop_id", "listing_id", "report_date",
-        "daily_sales", "daily_views", "created_at"
+        "shop_id",
+        "listing_id",
+        "report_date",
+        "daily_sales",
+        "daily_views",
+        "created_at"
     ],
     "partition_cols": ["year", "month", "date"],
     "isLoad": True,
     "requires_transform": True,
     "transform_config": {
-        "type": ["DERIVE_YMD", "PRICE_REVENUE"],  # ⭐ Kết hợp 2 transform
+        "type": ["DERIVE_YMD", "PRICE_REVENUE"],
         "join_table": "dim_listing_information",
         "join_key": "shop_id",
         "price_col": "price",
@@ -345,405 +229,51 @@ analysis_listing_information:
 
 ---
 
-### Kết Hợp Nhiều Transform
+## 7. Quy trình thêm bảng mới
 
-Có thể chạy **nhiều transform** theo thứ tự:
-
-```python
-"transform_config": {
-    "type": ["DERIVE_YMD", "PRICE_REVENUE"],  # ⭐ Thứ tự có ý nghĩa!
-    # Cấu hình cho PRICE_REVENUE
-    "join_table": "dim_listing_information",
-    "join_key": "shop_id",
-    "price_col": "price",
-    "sales_col": "daily_sales"
-}
-```
-
-**Thứ tự thực thi:**
-1. Đầu tiên: `DERIVE_YMD` → Tạo cột year, month, date
-2. Sau đó: `PRICE_REVENUE` → Join và tính revenue
+1. Xác định loại load (Full hoặc Incremental)
+2. Xác định danh sách cột cần trích xuất
+3. Xác định khóa deduplication
+4. Quyết định có sử dụng partition hay không
+5. Xác định các transform cần áp dụng
 
 ---
 
-## 📚 Các Ví Dụ Thực Tế
+## 8. Các lưu ý quan trọng
 
-### ❌ Sai - INCREMENTAL không có MERGE khi bảng chưa tồn tại
-
-```python
-# ❌ KHÔNG ĐÚNG
-{
-    "gold_table": "new_table",
-    "bronze_table": "new_bronze",
-    "load_type": "INCREMENTAL",  # Bảng chưa tồn tại!
-    "dedup_cols": ["id"],
-    "columns": ["id", "name"],
-    "isLoad": True,
-    "requires_transform": False
-}
-```
-
-**Vấn đề**: Lần đầu chạy, bảng Gold chưa tồn tại, code sẽ **tự động CREATE** bảng mới (không lỗi, nhưng log sẽ báo "Creating new table")
-
-**Giải pháp**: Không có gì sai, code xử lý tự động. Lần chạy thứ 2 trở đi mới dùng MERGE.
+* Incremental Load bắt buộc phải có `timestamp_col`
+* Các cột trong `dedup_cols` phải tạo thành khóa duy nhất
+* Nếu sử dụng partition, cần đảm bảo các cột partition được tạo ra từ transform
+* Các bảng dùng cho transform dạng join phải tồn tại trước khi pipeline chạy
 
 ---
 
-### ✅ Đúng - FULL LOAD Bảng Danh Mục
+## 9. Troubleshooting
+
+**Lỗi: Table không tồn tại**
+
+* Kiểm tra tên bảng, schema và lakehouse
+
+**Lỗi: Column không tồn tại**
+
+* Kiểm tra lại danh sách cột và kiểu chữ
+
+**Lỗi: Timestamp chứa giá trị NULL**
+
+* Làm sạch dữ liệu Bronze hoặc bổ sung logic xử lý NULL
+
+---
+
+## 10. Tối ưu hiệu suất
+
+* Ưu tiên Incremental Load cho các bảng lớn
+* Sử dụng partition theo ngày cho các bảng fact
+* Điều chỉnh số lượng worker để tận dụng khả năng xử lý song song
 
 ```python
-# ✅ ĐÚNG
-{
-    "gold_table": "dim_category",
-    "bronze_table": "categories",
-    "load_type": "FULL",
-    "table_category": "DIMENSION",
-    "timestamp_col": None,           # Không cần timestamp
-    "dedup_cols": ["category_id"],   # Khóa duy nhất
-    "columns": ["category_id", "name", "description"],
-    "partition_cols": None,          # Không partition
-    "isLoad": True,
-    "requires_transform": False
-}
+run_gold_pipeline(TABLE_CONFIGS, max_workers=8)
 ```
 
 ---
 
-### ✅ Đúng - INCREMENTAL Bảng Event với Transform
-
-```python
-# ✅ ĐÚNG
-{
-    "gold_table": "fact_user_events",
-    "bronze_table": "user_events",
-    "load_type": "INCREMENTAL",
-    "table_category": "FACT",
-    "timestamp_col": "event_timestamp",          # ⭐ Dùng để filter & dedup
-    "partition_timestamp_col": "event_timestamp",
-    "dedup_cols": ["user_id", "event_id", "event_date"],  # ⭐ Khóa duy nhất
-    "columns": [
-        "user_id", "event_id", "event_date",
-        "event_type", "event_value", "event_timestamp"
-    ],
-    "partition_cols": ["year", "month", "date"],
-    "isLoad": True,
-    "requires_transform": True,
-    "transform_config": {
-        "type": ["DERIVE_YMD"]
-    }
-}
-```
-
-**Giải thích:**
-- ✅ Có `timestamp_col` → Filter chỉ dữ liệu mới
-- ✅ Có `dedup_cols` → Đảm bảo 1 event chỉ có 1 hàng
-- ✅ Có `partition_cols` → Chia dữ liệu theo ngày
-- ✅ Transform `DERIVE_YMD` → Tạo cột year, month, date
-
----
-
-### ✅ Đúng - FULL LOAD Bảng Snapshot Hàng Ngày
-
-```python
-# ✅ ĐÚNG
-{
-    "gold_table": "dim_user_snapshot",
-    "bronze_table": "user_daily_snapshot",
-    "load_type": "FULL",                        # ⭐ FULL vì snapshot toàn bộ
-    "table_category": "DIMENSION",
-    "timestamp_col": "snapshot_date",
-    "partition_timestamp_col": "snapshot_date",
-    "dedup_cols": ["user_id", "snapshot_date"],
-    "columns": [
-        "user_id", "name", "status", "subscription_tier",
-        "total_purchases", "snapshot_date"
-    ],
-    "partition_cols": ["year", "month", "date"],
-    "isLoad": True,
-    "requires_transform": True,
-    "transform_config": {
-        "type": ["DERIVE_YMD"]
-    }
-}
-```
-
-**Lý do FULL LOAD:**
-- Snapshot hàng ngày → Cần reload toàn bộ
-- Dữ liệu không lớn (khoảng 100K-1M hàng/ngày)
-- Cần refresh hoàn toàn trạng thái người dùng
-
----
-
-## 🚀 Cách Thêm Bảng Mới
-
-### Bước 1: Chọn Load Type
-
-| Chọn | Nếu |
-|------|-----|
-| **FULL LOAD** | Bảng nhỏ, lookup, snapshot, thay đổi hoàn toàn |
-| **INCREMENTAL LOAD** | Bảng lớn, dữ liệu thêm liên tục, cần tối ưu |
-
-### Bước 2: Xác Định Cột
-
-```python
-"columns": [
-    # Chỉ lấy cột cần thiết
-    # ❌ KHÔNG lấy cột không cần
-    # ✅ Phải bao gồm cột timestamp
-]
-```
-
-### Bước 3: Xác Định Dedup
-
-```python
-"dedup_cols": [
-    # Khóa duy nhất của bảng
-    # VD: ["id"] hoặc ["shop_id", "date"] hoặc ["user_id", "product_id", "timestamp"]
-]
-```
-
-### Bước 4: Xác Định Partition (Nếu Cần)
-
-```python
-"partition_cols": ["year", "month", "date"]  # hoặc None
-```
-
-### Bước 5: Xác Định Transform (Nếu Cần)
-
-```python
-"requires_transform": True,
-"transform_config": {
-    "type": ["DERIVE_YMD"]  # hoặc ["DERIVE_YMD", "PRICE_REVENUE"]
-    # ... cấu hình thêm nếu có ...
-}
-```
-
----
-
-## 💡 Các Lưu Ý Quan Trọng
-
-### ⚠️ Lưu Ý 1: Cột Timestamp
-- **Bắt buộc** cho `INCREMENTAL LOAD`
-- Dùng để filter dữ liệu mới
-- Dùng để dedup (giữ bản ghi mới nhất)
-- **Phải có giá trị** (không NULL)
-
-```python
-# ✅ Đúng
-"timestamp_col": "created_at",
-
-# ❌ Sai
-"timestamp_col": None,  # Với INCREMENTAL
-```
-
-### ⚠️ Lưu Ý 2: Dedup Cols
-- Phải là **khóa duy nhất** của bảng
-- Không thể để trống cho FULL LOAD
-- Có thể để trống nếu không cần dedup (hiếm gặp)
-
-```python
-# ✅ Đúng
-"dedup_cols": ["listing_id"],  # 1 listing = 1 hàng
-
-# ✅ Đúng  
-"dedup_cols": ["shop_id", "report_date"],  # 1 shop/ngày = 1 hàng
-
-# ❌ Sai
-"dedup_cols": ["name"],  # Tên không phải khóa duy nhất!
-```
-
-### ⚠️ Lưu Ý 3: Cột Partition
-- Giúp **tối ưu query**
-- Không bắt buộc
-- Thường là `["year", "month", "date"]`
-- Phải có cột `year`, `month`, `date` trong dữ liệu (sau transform)
-
-```python
-# ✅ Đúng
-"partition_cols": ["year", "month", "date"],
-"requires_transform": True,
-"transform_config": {"type": ["DERIVE_YMD"]}
-
-# ❌ Sai
-"partition_cols": ["year", "month", "date"],  # Nhưng không tạo cột này!
-"requires_transform": False
-```
-
-### ⚠️ Lưu Ý 4: Transform PRICE_REVENUE
-- Bảng join phải **tồn tại** trước
-- Dùng **bản ghi mới nhất** của bảng join
-- Nếu LEFT JOIN → NULL price = 0
-
-```python
-# ✅ Đúng
-"transform_config": {
-    "type": ["DERIVE_YMD", "PRICE_REVENUE"],
-    "join_table": "dim_listing_information",  # Bảng này phải load trước
-    "join_key": "shop_id",
-    "price_col": "price",
-    "sales_col": "daily_sales"
-}
-```
-
----
-
-## ✅ Quy Trình Kiểm Tra Trước Khi Chạy
-
-```
-1. ✓ Bảng Bronze tồn tại?
-   → SELECT * FROM lh_sidcorp_poc_bronze.dbo.<bronze_table> LIMIT 5
-   
-2. ✓ Cột trong "columns" có tồn tại không?
-   → DESC lh_sidcorp_poc_bronze.dbo.<bronze_table>
-   
-3. ✓ Cột timestamp có giá trị không (không NULL)?
-   → SELECT COUNT(*) FROM ... WHERE <timestamp_col> IS NULL
-   
-4. ✓ Cột dedup_cols có giá trị duy nhất không?
-   → SELECT <dedup_cols>, COUNT(*) as cnt FROM ... GROUP BY <dedup_cols> HAVING cnt > 1
-   
-5. ✓ Nếu dùng PRICE_REVENUE, bảng join có tồn tại không?
-   → SELECT COUNT(*) FROM lh_sidcorp_poc_gold.dbo.<join_table>
-```
-
----
-
-## 🐛 Troubleshooting
-
-### ❌ Lỗi: "Table doesn't exist"
-```
-Error: Table lh_sidcorp_poc_bronze.dbo.<bronze_table> doesn't exist
-```
-**Giải pháp:**
-- Kiểm tra tên bảng Bronze (case-sensitive)
-- Kiểm tra schema (phải là `dbo`)
-- Kiểm tra lakehouse name
-
-### ❌ Lỗi: "Column not found"
-```
-Error: Column '<column_name>' doesn't exist
-```
-**Giải pháp:**
-- Kiểm tra tên cột trong Bronze
-- Kiểm tra spelling (case-sensitive)
-- Dùng `DESC` để xem danh sách cột
-
-### ❌ Lỗi: "Cannot dedup because timestamp is null"
-**Giải pháp:**
-- Filter dữ liệu Bronze để loại bỏ NULL timestamp
-- Hoặc thêm cột timestamp mới
-
-### ❌ Lỗi: "PRICE_REVENUE: Column 'price' not found in joined table"
-**Giải pháp:**
-- Kiểm tra bảng join có cột `price` không
-- Kiểm tra spelling
-- Kiểm tra cấu hình `join_table` và `price_col`
-
----
-
-## 📊 Mẹo Tối Ưu Performance
-
-### 1. Chọn Đúng Load Type
-```python
-# ✅ Nhanh (chỉ tải dữ liệu mới)
-"load_type": "INCREMENTAL"
-
-# ❌ Chậm (tải toàn bộ)
-"load_type": "FULL"
-```
-
-### 2. Partition Đúng
-```python
-# ✅ Tối ưu (scan ít dữ liệu)
-"partition_cols": ["year", "month", "date"]
-
-# ❌ Không tối ưu (scan toàn bộ)
-"partition_cols": None
-```
-
-### 3. Số Worker (Parallelization)
-```python
-# Tăng max_workers để chạy nhanh hơn
-run_gold_pipeline(TABLE_CONFIGS, max_workers=8)  # Default 4
-```
-
----
-
-## 📝 Template Nhanh
-
-### Template 1: FULL LOAD - Bảng Danh Mục
-```python
-{
-    "gold_table": "dim_xxx",
-    "bronze_table": "xxx",
-    "load_type": "FULL",
-    "table_category": "DIMENSION",
-    "timestamp_col": None,
-    "dedup_cols": ["id"],
-    "columns": ["id", "name", "..."],
-    "partition_cols": None,
-    "isLoad": True,
-    "requires_transform": False
-}
-```
-
-### Template 2: INCREMENTAL LOAD - Bảng Sự Kiện
-```python
-{
-    "gold_table": "fact_xxx",
-    "bronze_table": "xxx",
-    "load_type": "INCREMENTAL",
-    "table_category": "FACT",
-    "timestamp_col": "created_at",
-    "partition_timestamp_col": "created_at",
-    "dedup_cols": ["id"],
-    "columns": ["id", "created_at", "..."],
-    "partition_cols": ["year", "month", "date"],
-    "isLoad": True,
-    "requires_transform": True,
-    "transform_config": {"type": ["DERIVE_YMD"]}
-}
-```
-
-### Template 3: INCREMENTAL + PRICE_REVENUE
-```python
-{
-    "gold_table": "fact_xxx",
-    "bronze_table": "xxx",
-    "load_type": "INCREMENTAL",
-    "table_category": "FACT",
-    "timestamp_col": "created_at",
-    "partition_timestamp_col": "created_at",
-    "dedup_cols": ["shop_id", "date"],
-    "columns": ["shop_id", "sales", "created_at", "..."],
-    "partition_cols": ["year", "month", "date"],
-    "isLoad": True,
-    "requires_transform": True,
-    "transform_config": {
-        "type": ["DERIVE_YMD", "PRICE_REVENUE"],
-        "join_table": "dim_listing_information",
-        "join_key": "shop_id",
-        "price_col": "price",
-        "sales_col": "sales"
-    }
-}
-```
-
----
-
-## 🎯 Tóm Tắt
-
-| Tiêu Chí | FULL LOAD | INCREMENTAL LOAD |
-|---------|-----------|-----------------|
-| **Khi nào dùng** | Bảng nhỏ, lookup, snapshot | Bảng lớn, thêm liên tục |
-| **Tốc độ** | Chậm (tải toàn bộ) | Nhanh (chỉ tải mới) |
-| **Merge** | ❌ Không | ✅ Có |
-| **Lần đầu** | Tạo bảng mới | Tạo bảng mới |
-| **Lần 2+** | Xóa cũ → Tạo mới | Merge (UPDATE/INSERT) |
-| **Timestamp** | Tùy chọn | Bắt buộc |
-| **Dedup** | Thường có | Thường có |
-| **Partition** | Tùy chọn | Nên có |
-
----
-
-**📞 Hỗ trợ**: Xem mã nguồn `nb_bronze2gold.py` để hiểu chi tiết hơn về các hàm xử lý.
+Tài liệu này đóng vai trò như một hướng dẫn chuẩn để triển khai, vận hành và mở rộng pipeline Bronze to Gold trong môi trường Lakehouse.
